@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
-import { getNextOpening } from '@/lib/countdown';
+import { resolveStatus, groupReportsByBridge } from '@/lib/status';
+import { Bridge, BridgeReport, EnrichedBridge } from '@/lib/types';
+
+// How far back to pull reports for live community consensus.
+const REPORT_LOOKBACK_MS = 30 * 60 * 1000; // 30 minutes
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -18,23 +22,34 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 
-  let results = bridges || [];
+  let results: Bridge[] = bridges || [];
 
   if (lat && lng && radius) {
     const userLat = parseFloat(lat);
     const userLng = parseFloat(lng);
     const radiusMiles = parseFloat(radius);
-
-    results = results.filter((bridge) => {
-      const dist = haversine(userLat, userLng, bridge.latitude, bridge.longitude);
-      return dist <= radiusMiles;
-    });
+    results = results.filter(
+      (bridge) => haversine(userLat, userLng, bridge.latitude, bridge.longitude) <= radiusMiles
+    );
   }
 
-  const enriched = results.map((bridge) => ({
-    ...bridge,
-    nextOpening: getNextOpening(bridge.schedule)?.toISOString() || null,
-  }));
+  // One query for all recent reports, then resolve each bridge locally.
+  const cutoff = new Date(Date.now() - REPORT_LOOKBACK_MS).toISOString();
+  const { data: reports } = await supabase
+    .from('bridge_reports')
+    .select('*')
+    .gte('created_at', cutoff);
+  const reportsByBridge = groupReportsByBridge((reports as BridgeReport[]) || []);
+
+  const now = new Date();
+  const enriched: EnrichedBridge[] = results.map((bridge) => {
+    const status = resolveStatus({
+      bridge,
+      reports: reportsByBridge.get(bridge.id) || [],
+      now,
+    });
+    return { ...bridge, status, nextOpening: status.nextOpening };
+  });
 
   return NextResponse.json(enriched);
 }
